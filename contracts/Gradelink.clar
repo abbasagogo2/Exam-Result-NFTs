@@ -9,9 +9,14 @@
 (define-constant ERR_UNAUTHORIZED (err u104))
 (define-constant ERR_INVALID_STUDENT (err u105))
 (define-constant ERR_EXAM_CLOSED (err u106))
+(define-constant ERR_SCHOLARSHIP_NOT_FOUND (err u107))
+(define-constant ERR_SCHOLARSHIP_EXPIRED (err u108))
+(define-constant ERR_INSUFFICIENT_ACHIEVEMENTS (err u109))
+(define-constant ERR_ALREADY_AWARDED (err u110))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
+(define-data-var last-scholarship-id uint u0)
 
 (define-map exam-results uint {
     student-id: (string-ascii 64),
@@ -44,6 +49,38 @@
 })
 
 (define-map institution-admins principal (string-ascii 128))
+
+(define-map scholarship-programs uint {
+    name: (string-ascii 128),
+    institution: (string-ascii 128),
+    creator: principal,
+    min-gpa: uint,
+    min-consecutive-high-grades: uint,
+    required-subject: (optional (string-ascii 64)),
+    award-amount: uint,
+    max-recipients: uint,
+    current-recipients: uint,
+    expiry-block: uint,
+    active: bool
+})
+
+(define-map student-achievements (string-ascii 64) {
+    consecutive-a-grades: uint,
+    consecutive-b-plus-grades: uint,
+    subject-excellence-count: uint,
+    last-achievement-block: uint,
+    total-scholarship-awards: uint
+})
+
+(define-map scholarship-awards uint {
+    scholarship-id: uint,
+    student-id: (string-ascii 64),
+    award-amount: uint,
+    awarded-block: uint,
+    institution: (string-ascii 128)
+})
+
+(define-map student-scholarship-eligibility (string-ascii 64) (list 10 uint))
 
 (define-public (get-last-token-id)
     (ok (var-get last-token-id))
@@ -180,6 +217,7 @@
                             total-exams: (+ (get total-exams student) u1)
                         }))
                         (var-set last-token-id token-id)
+                        (unwrap-panic (update-student-achievements student-id grade (get subject exam-session)))
                         (print {
                             event: "exam-result-recorded",
                             token-id: token-id,
@@ -293,4 +331,192 @@
 )
 
 
+(define-public (create-scholarship-program 
+    (name (string-ascii 128))
+    (institution (string-ascii 128))
+    (min-gpa uint)
+    (min-consecutive-high-grades uint)
+    (required-subject (optional (string-ascii 64)))
+    (award-amount uint)
+    (max-recipients uint)
+    (expiry-block uint)
+)
+    (let 
+        (
+            (scholarship-id (+ (var-get last-scholarship-id) u1))
+        )
+        (if (or (is-eq tx-sender CONTRACT_OWNER) (is-some (map-get? authorized-instructors tx-sender)))
+            (begin
+                (map-set scholarship-programs scholarship-id {
+                    name: name,
+                    institution: institution,
+                    creator: tx-sender,
+                    min-gpa: min-gpa,
+                    min-consecutive-high-grades: min-consecutive-high-grades,
+                    required-subject: required-subject,
+                    award-amount: award-amount,
+                    max-recipients: max-recipients,
+                    current-recipients: u0,
+                    expiry-block: expiry-block,
+                    active: true
+                })
+                (var-set last-scholarship-id scholarship-id)
+                (print {
+                    event: "scholarship-program-created",
+                    scholarship-id: scholarship-id,
+                    name: name,
+                    institution: institution,
+                    award-amount: award-amount
+                })
+                (ok scholarship-id)
+            )
+            (err ERR_UNAUTHORIZED)
+        )
+    )
+)
+
+(define-private (is-grade-a-or-higher (grade (string-ascii 8)))
+    (or (is-eq grade "A+") (is-eq grade "A") (is-eq grade "A-"))
+)
+
+(define-private (is-grade-b-plus-or-higher (grade (string-ascii 8)))
+    (or (is-eq grade "A+") (is-eq grade "A") (is-eq grade "A-") (is-eq grade "B+"))
+)
+
+(define-private (update-student-achievements (student-id (string-ascii 64)) (grade (string-ascii 8)) (subject (string-ascii 64)))
+    (let 
+        (
+            (current-achievements (default-to {
+                consecutive-a-grades: u0,
+                consecutive-b-plus-grades: u0,
+                subject-excellence-count: u0,
+                last-achievement-block: u0,
+                total-scholarship-awards: u0
+            } (map-get? student-achievements student-id)))
+            (is-a-grade (is-grade-a-or-higher grade))
+            (is-b-plus-grade (is-grade-b-plus-or-higher grade))
+        )
+        (map-set student-achievements student-id {
+            consecutive-a-grades: (if is-a-grade 
+                (+ (get consecutive-a-grades current-achievements) u1) 
+                u0),
+            consecutive-b-plus-grades: (if is-b-plus-grade 
+                (+ (get consecutive-b-plus-grades current-achievements) u1) 
+                u0),
+            subject-excellence-count: (if is-a-grade 
+                (+ (get subject-excellence-count current-achievements) u1)
+                (get subject-excellence-count current-achievements)),
+            last-achievement-block: stacks-block-height,
+            total-scholarship-awards: (get total-scholarship-awards current-achievements)
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-gpa-eligibility (student-id (string-ascii 64)) (required-gpa uint) (exam-tokens (list 50 uint)))
+    (match (calculate-gpa student-id exam-tokens)
+        gpa-value (>= gpa-value required-gpa)
+        false
+    )
+)
+
+(define-private (check-scholarship-eligibility (student-id (string-ascii 64)) (scholarship-id uint) (exam-tokens (list 50 uint)))
+    (match (map-get? scholarship-programs scholarship-id)
+        program (let 
+            (
+                (achievements (default-to {
+                    consecutive-a-grades: u0,
+                    consecutive-b-plus-grades: u0,
+                    subject-excellence-count: u0,
+                    last-achievement-block: u0,
+                    total-scholarship-awards: u0
+                } (map-get? student-achievements student-id)))
+                (meets-gpa (check-gpa-eligibility student-id (get min-gpa program) exam-tokens))
+                (meets-consecutive (>= (get consecutive-b-plus-grades achievements) (get min-consecutive-high-grades program)))
+                (program-active (get active program))
+                (not-expired (< stacks-block-height (get expiry-block program)))
+                (has-capacity (< (get current-recipients program) (get max-recipients program)))
+            )
+            (and meets-gpa meets-consecutive program-active not-expired has-capacity)
+        )
+        false
+    )
+)
+
+(define-public (award-scholarship (student-id (string-ascii 64)) (scholarship-id uint) (exam-tokens (list 50 uint)))
+    (let 
+        (
+            (program (unwrap! (map-get? scholarship-programs scholarship-id) (err ERR_SCHOLARSHIP_NOT_FOUND)))
+            (eligible (check-scholarship-eligibility student-id scholarship-id exam-tokens))
+            (award-id (+ (var-get last-scholarship-id) u1))
+        )
+        (if (not eligible)
+            (err ERR_INSUFFICIENT_ACHIEVEMENTS)
+            (if (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get creator program)))
+                (begin
+                    (map-set scholarship-awards award-id {
+                        scholarship-id: scholarship-id,
+                        student-id: student-id,
+                        award-amount: (get award-amount program),
+                        awarded-block: stacks-block-height,
+                        institution: (get institution program)
+                    })
+                    (map-set scholarship-programs scholarship-id (merge program {
+                        current-recipients: (+ (get current-recipients program) u1)
+                    }))
+                    (let 
+                        (
+                            (current-achievements (unwrap-panic (map-get? student-achievements student-id)))
+                        )
+                        (map-set student-achievements student-id (merge current-achievements {
+                            total-scholarship-awards: (+ (get total-scholarship-awards current-achievements) u1)
+                        }))
+                    )
+                    (print {
+                        event: "scholarship-awarded",
+                        award-id: award-id,
+                        scholarship-id: scholarship-id,
+                        student-id: student-id,
+                        award-amount: (get award-amount program)
+                    })
+                    (ok award-id)
+                )
+                (err ERR_UNAUTHORIZED)
+            )
+        )
+    )
+)
+
+(define-public (get-student-achievements (student-id (string-ascii 64)))
+    (ok (map-get? student-achievements student-id))
+)
+
+(define-public (get-scholarship-program (scholarship-id uint))
+    (ok (map-get? scholarship-programs scholarship-id))
+)
+
+(define-public (get-scholarship-award (award-id uint))
+    (ok (map-get? scholarship-awards award-id))
+)
+
+(define-public (check-scholarship-eligibility-public (student-id (string-ascii 64)) (scholarship-id uint) (exam-tokens (list 50 uint)))
+    (ok (check-scholarship-eligibility student-id scholarship-id exam-tokens))
+)
+
+(define-read-only (get-student-eligible-scholarships (student-id (string-ascii 64)) (scholarship-ids (list 10 uint)) (exam-tokens (list 50 uint)))
+    scholarship-ids
+)
+
+(define-public (deactivate-scholarship-program (scholarship-id uint))
+    (match (map-get? scholarship-programs scholarship-id)
+        program (if (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get creator program)))
+            (ok (map-set scholarship-programs scholarship-id (merge program { active: false })))
+            (err ERR_UNAUTHORIZED)
+        )
+        (err ERR_SCHOLARSHIP_NOT_FOUND)
+    )
+)
+
 (map-set authorized-instructors CONTRACT_OWNER true)
+
+
